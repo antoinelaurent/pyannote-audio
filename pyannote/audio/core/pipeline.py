@@ -42,7 +42,7 @@ from pyannote.audio.core.model import Model
 from pyannote.audio.utils.hf_hub import AssetFileName, download_from_hf_hub
 from pyannote.audio.utils.reproducibility import fix_reproducibility
 from pyannote.audio.utils.version import check_version
-
+from pyannote.audio.__main__ import parse_device
 
 def expand_subfolders(
     config,
@@ -218,7 +218,9 @@ class Pipeline(_Pipeline):
 
         # send pipeline to specified device
         if "device" in config:
-            device = torch.device(config["device"])
+            torch_device = parse_device(config["device"])
+            device = torch.device(torch_device)
+
             try:
                 pipeline.to(device)
             except RuntimeError as e:
