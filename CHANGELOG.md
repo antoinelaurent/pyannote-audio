@@ -11,6 +11,7 @@ Models can now be stored alongside their pipelines in the same repository, strea
 - ~~accept `pyannote/segmentation-3.0` model user agreement~~
 - ~~accept `pyannote/wespeaker-voxceleb-resnet34-LM` model user agreement~~
 - load pipeline with `Pipeline.from_pretrained("pyannote/speaker-diarization-3.1", token=True)`
+- load pipeline with `Pipeline.from_pretrained` where device can be equal to "auto"
 
 #### Improve speech separation quality
 
