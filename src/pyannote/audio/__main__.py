@@ -25,6 +25,7 @@
 # SOFTWARE.
 
 import json
+import shutil
 import sys
 import time
 import types
@@ -107,6 +108,16 @@ def get_diarization(prediction) -> Annotation:
         return prediction.speaker_diarization
 
     raise ValueError("Could not find speaker diarization in prediction.")
+
+
+def get_shard_range(tot: int, nshard: int, rank: int) -> tuple[int, int]:
+    """Compute the [start, end) slice of `tot` items assigned to shard `rank`"""
+
+    assert 0 <= rank < nshard, f"invalid rank/nshard {rank}/{nshard}"
+    start = round(tot / nshard * rank)
+    end = round(tot / nshard * (rank + 1))
+    assert start < end, f"start={start}, end={end}"
+    return start, end
 
 
 app = typer.Typer()
@@ -510,6 +521,175 @@ class MinDurationOffOptimizer:
         return best_min_duration_off, self._reports[best_min_duration_off]
 
 
+def _aggregate_shards(
+    into: Path,
+    benchmark_name: str,
+    nshard: int,
+    files: list,
+    per_file: bool,
+    optimize: bool,
+):
+    """Combine per-shard benchmark outputs (written by --nshard N --rank 0..N-1)
+    into the same combined RTTM/JSON/metric files a non-sharded run would
+    produce, then compute the DiarizationErrorRate over all of them.
+    """
+
+    from pyannote.database.util import load_rttm
+
+    files_by_uri = {file["uri"]: file for file in files}
+    metric = DiarizationErrorRate()
+    speaker_count: dict[int, dict[int, int]] = dict()
+    serialized_predictions: dict[str, dict] = dict()
+
+    if per_file:
+        benchmark_dir = into / benchmark_name
+        if benchmark_dir.exists():
+            raise FileExistsError(f"{benchmark_dir} already exists.")
+        rttm_dir = benchmark_dir / "rttm"
+        rttm_dir.mkdir(parents=True)
+    else:
+        rttm_file = into / f"{benchmark_name}.rttm"
+        if rttm_file.exists():
+            raise FileExistsError(f"{rttm_file} already exists.")
+
+    for rank in range(nshard):
+        shard_name = f"{benchmark_name}.{rank}of{nshard}"
+
+        if per_file:
+            shard_rttm_dir = into / shard_name / "rttm"
+            if not shard_rttm_dir.exists():
+                print(f"Missing shard directory: {shard_rttm_dir}")
+                raise typer.Exit(code=1)
+            shard_json_dir = into / shard_name / "json"
+            shard_predictions = {
+                path.stem: load_rttm(path)[path.stem]
+                for path in sorted(shard_rttm_dir.glob("*.rttm"))
+            }
+        else:
+            shard_rttm = into / f"{shard_name}.rttm"
+            if not shard_rttm.exists():
+                print(f"Missing shard RTTM: {shard_rttm}")
+                raise typer.Exit(code=1)
+            shard_predictions = load_rttm(shard_rttm)
+
+            shard_json = into / f"{shard_name}.json"
+            if shard_json.exists():
+                with open(shard_json) as f:
+                    serialized_predictions.update(json.load(f))
+
+        for uri, speaker_diarization in shard_predictions.items():
+            if uri not in files_by_uri:
+                continue
+            file = files_by_uri[uri]
+
+            if per_file:
+                shutil.copy(shard_rttm_dir / f"{uri}.rttm", rttm_dir / f"{uri}.rttm")
+                shard_json_file = shard_json_dir / f"{uri}.json"
+                if shard_json_file.exists():
+                    json_dir = benchmark_dir / "json"
+                    json_dir.mkdir(exist_ok=True)
+                    shutil.copy(shard_json_file, json_dir / f"{uri}.json")
+            else:
+                with open(rttm_file, "a") as rttm:
+                    speaker_diarization.write_rttm(rttm)
+
+            _ = metric(
+                file["annotation"],
+                speaker_diarization,
+                uem=file.get("annotated", None),
+            )
+
+            pred_num_speakers: int = len(speaker_diarization.labels())
+            true_num_speakers: int = len(file["annotation"].labels())
+            speaker_count.setdefault(true_num_speakers, dict()).setdefault(
+                pred_num_speakers, 0
+            )
+            speaker_count[true_num_speakers][pred_num_speakers] += 1
+
+            if optimize:
+                file["speaker_diarization"] = speaker_diarization
+
+    if serialized_predictions and not per_file:
+        with open(into / f"{benchmark_name}.json", "w") as f:
+            json.dump(serialized_predictions, f, indent=2)
+
+    with open(into / f"{benchmark_name}.csv", "w") as csv:
+        metric.report().to_csv(csv)
+
+    with open(into / f"{benchmark_name}.txt", "w") as txt:
+        txt.write(str(metric))
+
+    max_true_speakers = max(speaker_count.keys())
+    max_pred_speakers = max(
+        max(speaker_count[true_speakers].keys())
+        for true_speakers in speaker_count.keys()
+    )
+    speaker_count_matrix = np.zeros(
+        (max_true_speakers + 1, max_pred_speakers + 1), dtype=int
+    )
+    for true_speakers, pred_counts in speaker_count.items():
+        for pred_speakers, count in pred_counts.items():
+            speaker_count_matrix[true_speakers, pred_speakers] = count
+
+    speaker_count_error: float = np.sum(
+        [
+            abs(true_speakers - pred_speakers) * count
+            for true_speakers, pred_counts in speaker_count.items()
+            for pred_speakers, count in pred_counts.items()
+        ]
+    ) / np.sum(speaker_count_matrix)
+
+    speaker_count_accuracy: float = np.sum(np.diag(speaker_count_matrix)) / np.sum(
+        speaker_count_matrix
+    )
+
+    np.savetxt(
+        into / f"{benchmark_name}.SpeakerCount.csv",
+        speaker_count_matrix,
+        delimiter=",",
+        fmt="%3d",
+        footer=f"Accuracy = {speaker_count_accuracy:.1%} / Average error = {speaker_count_error:.2f} speakers off",
+    )
+
+    if not optimize:
+        return
+
+    minDurationOffOptimizer = MinDurationOffOptimizer()
+    best_min_duration_off, best_report = minDurationOffOptimizer(files, metric)
+
+    with open(into / f"{benchmark_name}.OptimizedMinDurationOff.csv", "w") as csv:
+        best_report.to_csv(csv)
+
+    with open(into / f"{benchmark_name}.OptimizedMinDurationOff.txt", "w") as txt:
+        txt.write(
+            best_report.to_string(
+                sparsify=False, float_format=lambda f: "{0:.2f}".format(f)
+            )
+        )
+
+    with open(into / f"{benchmark_name}.OptimizedMinDurationOff.yml", "w") as yml:
+        yaml.dump({"min_duration_off": best_min_duration_off}, yml)
+
+    if per_file:
+        for file in files:
+            if "best_speaker_diarization" not in file:
+                continue
+            optimized_rttm_file = (
+                rttm_dir / f"{file['uri']}.OptimizedMinDurationOff.rttm"
+            )
+            with open(optimized_rttm_file, "w") as rttm:
+                file["best_speaker_diarization"].write_rttm(rttm)
+    else:
+        optimized_rttm_file = into / f"{benchmark_name}.OptimizedMinDurationOff.rttm"
+        if optimized_rttm_file.exists():
+            raise FileExistsError(f"{optimized_rttm_file} already exists.")
+        with open(optimized_rttm_file, "a") as rttm:
+            for file in files:
+                if "best_speaker_diarization" not in file:
+                    continue
+                file["best_speaker_diarization"].write_rttm(rttm)
+
+
 @app.command("benchmark")
 def benchmark(
     pipeline: Annotated[
@@ -592,6 +772,17 @@ def benchmark(
     per_file: Annotated[
         bool, typer.Option(help="Save one RTTM/JSON file per processed audio file.")
     ] = False,
+    nshard: Annotated[
+        int, typer.Option(help="Total number of shards.")
+    ] = 1,
+    rank: Annotated[
+        int,
+        typer.Option(
+            help="Shard index to process (0-based). Only used when --nshard > 1. "
+            "Use -1 to aggregate all shards and compute metrics, once every shard "
+            "has been run."
+        ),
+    ] = -1,
 ):
     """
     Benchmark a pretrained diarization PIPELINE
@@ -602,20 +793,10 @@ def benchmark(
     by filling short within speaker gaps and save the results in a separate file.
     """
 
-    # load pretrained pipeline
-    pretrained_pipeline = Pipeline.from_pretrained(
-        pipeline,
-        revision=revision,
-        token=token,
-        cache_dir=cache,
-    )
-    if pretrained_pipeline is None:
-        print(f"Could not load pretrained pipeline from {pipeline}.")
-        raise typer.exit(code=1)
-
-    # send pipeline to device
-    torch_device = parse_device(device)
-    pretrained_pipeline.to(torch_device)
+    assert nshard >= 1, f"nshard must be >= 1, got {nshard}"
+    assert rank == -1 or (
+        0 <= rank < nshard
+    ), f"rank must be -1 or in [0, nshard), got rank={rank}, nshard={nshard}"
 
     # load protocol from (optional) registry
     if registry:
@@ -636,19 +817,51 @@ def benchmark(
     )
     files = list(getattr(loaded_protocol, subset.value)())
 
-    # check that manual annotation is available for all files
-    # (condition to actually run the benchmark)
-    skip_metric = False
-    if any(file.get("annotation", None) is None for file in files):
-        print(
-            f"Manual annotation is not available for files in {protocol} {subset.value} subset so skipping metric evaluation."
-        )
-        skip_metric = True
-
     # `benchmark_name` is used as prefix to output files
     benchmark_name = f"{protocol}.{subset.value}"
     if num_speakers == NumSpeakers.ORACLE:
         benchmark_name += ".OracleNumSpeakers"
+
+    # aggregation mode: every shard has already been run with its own
+    # --rank in [0, nshard), so just combine their outputs and compute
+    # metrics over the full subset. no pipeline is loaded for this.
+    if nshard > 1 and rank == -1:
+        _aggregate_shards(into, benchmark_name, nshard, files, per_file, optimize)
+        raise typer.Exit()
+
+    # load pretrained pipeline
+    pretrained_pipeline = Pipeline.from_pretrained(
+        pipeline,
+        revision=revision,
+        token=token,
+        cache_dir=cache,
+    )
+    if pretrained_pipeline is None:
+        print(f"Could not load pretrained pipeline from {pipeline}.")
+        raise typer.exit(code=1)
+
+    # send pipeline to device
+    torch_device = parse_device(device)
+    pretrained_pipeline.to(torch_device)
+
+    # restrict to this shard's slice of files, and disambiguate output
+    # filenames so shards run in parallel never clash with one another.
+    # metrics are only computed in aggregation mode (--rank -1), never
+    # during shard inference, since no single shard covers the full subset.
+    if nshard > 1:
+        start, end = get_shard_range(len(files), nshard, rank)
+        files = files[start:end]
+        benchmark_name += f".{rank}of{nshard}"
+        skip_metric = True
+    else:
+        # check that manual annotation is available for all files
+        # (condition to actually run the benchmark)
+        skip_metric = False
+        if any(file.get("annotation", None) is None for file in files):
+            print(
+                f"Manual annotation is not available for files in {protocol} {subset.value} subset so skipping metric evaluation."
+            )
+            skip_metric = True
 
     # used to store raw predictions in JSON format
     serialized_predictions: dict[str, dict] = dict()
