@@ -110,6 +110,108 @@ def get_diarization(prediction) -> Annotation:
     raise ValueError("Could not find speaker diarization in prediction.")
 
 
+def get_transcription(prediction) -> Optional[list]:
+    """Word-level speaker-attributed transcription of a prediction.
+
+    Returns ``[{"start": …, "end": …, "speaker": …, "text": …}, …]`` for
+    speaker-attributed transcription outputs (e.g. pyannistt's or
+    research-models' SpeakerAttributedTranscriptionOutput), or None for
+    diarization-only predictions.
+    """
+    return getattr(prediction, "word_level_transcription", None)
+
+
+def write_stm(fp, uri: str, transcription: list):
+    """Append a word-level transcription to an STM file (pyannistt format)."""
+    for entry in transcription:
+        fp.write(
+            f"{uri} NA {entry['speaker']} {entry['start']:.3f} {entry['end']:.3f} {entry['text']}\n"
+        )
+
+
+class WERMetrics:
+    """cpWER / tcpWER / tcorcWER / WER over speaker-attributed transcriptions.
+
+    Thin aggregator around the pyannistt benchmark metrics; pyannistt (and its
+    meeteval dependency) is imported lazily so diarization-only benchmarks
+    don't need it installed. Raises ImportError if pyannistt is missing.
+    """
+
+    def __init__(self, normalizer: str = "file"):
+        from pyannistt.benchmark.metrics import (
+            ConcatenatedMinimumPermutationWordErrorRate,
+            TimeConstrainedMinimumPermutationWordErrorRate,
+            TimeConstrainedOptimalReferenceCombinationWordErrorRate,
+            WordErrorRate,
+            combine_wer_metrics,
+        )
+        from pyannistt.normalizers import Normalizer, get_normalizer
+
+        self._combine = combine_wer_metrics
+        self._get_normalizer = get_normalizer
+        self._normalizer = Normalizer(normalizer)
+
+        self.metrics = {
+            "wer": WordErrorRate(),
+            "tcpwer": TimeConstrainedMinimumPermutationWordErrorRate(collar=5.0),
+            "tcorcwer": TimeConstrainedOptimalReferenceCombinationWordErrorRate(
+                collar=5.0
+            ),
+            "cpwer": ConcatenatedMinimumPermutationWordErrorRate(),
+        }
+
+    def __call__(self, file: dict, transcription: list):
+        """Accumulate all four metrics for one file.
+
+        Parameters
+        ----------
+        file : dict
+            Protocol file, with a "transcription" reference (meeteval SegLST).
+        transcription : list
+            Predicted word-level transcription
+            ``[{"start": …, "end": …, "speaker": …, "text": …}, …]``.
+        """
+        from meeteval.io.seglst import SegLST, SegLstSegment
+
+        uri = file["uri"]
+        hypothesis = SegLST(
+            segments=[
+                SegLstSegment(
+                    session_id=uri,
+                    start_time=entry["start"],
+                    end_time=entry["end"],
+                    words=entry["text"],
+                    speaker=str(entry["speaker"]),
+                    segment_index=e,
+                )
+                for e, entry in enumerate(transcription)
+            ]
+        )
+
+        normalizer = self._get_normalizer(file, self._normalizer)
+        for metric in self.metrics.values():
+            metric.normalizer = normalizer
+            _ = metric(file["transcription"], hypothesis, uri=uri)
+
+    def report(self, into: Path, benchmark_name: str):
+        """Save each metric as CSV + human-readable text, plus a combined summary."""
+        for name, metric in self.metrics.items():
+            with open(into / f"{benchmark_name}.{name}.csv", "w") as csv:
+                metric.report().to_csv(csv)
+            with open(into / f"{benchmark_name}.{name}.txt", "w") as txt:
+                txt.write(str(metric))
+
+        with open(into / f"{benchmark_name}.wer_summary.txt", "w") as txt:
+            txt.write(
+                self._combine(
+                    self.metrics["wer"],
+                    self.metrics["tcpwer"],
+                    self.metrics["tcorcwer"],
+                    self.metrics["cpwer"],
+                )
+            )
+
+
 def get_shard_range(tot: int, nshard: int, rank: int) -> tuple[int, int]:
     """Compute the [start, end) slice of `tot` items assigned to shard `rank`"""
 
@@ -528,10 +630,15 @@ def _aggregate_shards(
     files: list,
     per_file: bool,
     optimize: bool,
+    normalizer: str = "file",
 ):
     """Combine per-shard benchmark outputs (written by --nshard N --rank 0..N-1)
     into the same combined RTTM/JSON/metric files a non-sharded run would
     produce, then compute the DiarizationErrorRate over all of them.
+
+    When shards also wrote STM files (speaker-attributed transcription
+    pipelines), those are combined too and cpWER/tcpWER/tcorcWER/WER are
+    computed over the full subset (requires pyannistt).
     """
 
     from pyannote.database.util import load_rttm
@@ -593,18 +700,19 @@ def _aggregate_shards(
                 with open(rttm_file, "a") as rttm:
                     speaker_diarization.write_rttm(rttm)
 
-            _ = metric(
-                file["annotation"],
-                speaker_diarization,
-                uem=file.get("annotated", None),
-            )
+            if file.get("annotation", None) is not None:
+                _ = metric(
+                    file["annotation"],
+                    speaker_diarization,
+                    uem=file.get("annotated", None),
+                )
 
-            pred_num_speakers: int = len(speaker_diarization.labels())
-            true_num_speakers: int = len(file["annotation"].labels())
-            speaker_count.setdefault(true_num_speakers, dict()).setdefault(
-                pred_num_speakers, 0
-            )
-            speaker_count[true_num_speakers][pred_num_speakers] += 1
+                pred_num_speakers: int = len(speaker_diarization.labels())
+                true_num_speakers: int = len(file["annotation"].labels())
+                speaker_count.setdefault(true_num_speakers, dict()).setdefault(
+                    pred_num_speakers, 0
+                )
+                speaker_count[true_num_speakers][pred_num_speakers] += 1
 
             if optimize:
                 file["speaker_diarization"] = speaker_diarization
@@ -612,6 +720,63 @@ def _aggregate_shards(
     if serialized_predictions and not per_file:
         with open(into / f"{benchmark_name}.json", "w") as f:
             json.dump(serialized_predictions, f, indent=2)
+
+    # combine per-shard STM files (written by speaker-attributed transcription
+    # pipelines) and compute cpWER/tcpWER/tcorcWER/WER over the full subset
+    shard_stms: list[Path] = []
+    for rank in range(nshard):
+        shard_name = f"{benchmark_name}.{rank}of{nshard}"
+        if per_file:
+            shard_stm_dir = into / shard_name / "stm"
+            if shard_stm_dir.exists():
+                shard_stms.extend(sorted(shard_stm_dir.glob("*.stm")))
+        else:
+            shard_stm = into / f"{shard_name}.stm"
+            if shard_stm.exists():
+                shard_stms.append(shard_stm)
+
+    if shard_stms:
+        combined_stm = into / f"{benchmark_name}.stm"
+        if combined_stm.exists():
+            raise FileExistsError(f"{combined_stm} already exists.")
+
+        if per_file:
+            stm_dir = benchmark_dir / "stm"
+            stm_dir.mkdir(exist_ok=True)
+
+        with open(combined_stm, "w") as combined:
+            for shard_stm in shard_stms:
+                combined.write(shard_stm.read_text())
+                if per_file:
+                    shutil.copy(shard_stm, stm_dir / shard_stm.name)
+
+        if any(file.get("transcription", None) is None for file in files):
+            print(
+                "Manual transcription is not available for all files so skipping WER evaluation."
+            )
+        else:
+            try:
+                wer_metrics = WERMetrics(normalizer=normalizer)
+                from pyannistt.benchmark.precomputed import Precomputed
+            except ImportError:
+                print(
+                    "pyannistt is not available so skipping WER evaluation "
+                    "(pip install pyannistt to get cpWER/tcpWER/tcorcWER/WER)."
+                )
+            else:
+                precomputed = Precomputed(combined_stm)
+                for file in files:
+                    # bypass Pipeline.__call__: it validates that audio is
+                    # available, which aggregation doesn't need (nor want —
+                    # rank -1 may run on a machine without the audio files)
+                    prediction = precomputed.apply(file)
+                    wer_metrics(file, prediction.word_level_transcription)
+                wer_metrics.report(into, benchmark_name)
+
+    # no DER / speaker-count reports without any manual annotation
+    # (e.g. transcription-only protocols)
+    if not speaker_count:
+        return
 
     with open(into / f"{benchmark_name}.csv", "w") as csv:
         metric.report().to_csv(csv)
@@ -772,6 +937,14 @@ def benchmark(
     per_file: Annotated[
         bool, typer.Option(help="Save one RTTM/JSON file per processed audio file.")
     ] = False,
+    normalizer: Annotated[
+        str,
+        typer.Option(
+            help="Text normalization for WER metrics (none, file, english, chinese). "
+            "'file' uses each protocol file's 'language' key. Only used when the "
+            "pipeline outputs a speaker-attributed transcription."
+        ),
+    ] = "file",
     nshard: Annotated[
         int, typer.Option(help="Total number of shards.")
     ] = 1,
@@ -791,6 +964,11 @@ def benchmark(
     save the results in RTTM format, and compute the Diarization Error Rate (DER)
     for each file. If `--optimize` is used, it will also post-process predictions
     by filling short within speaker gaps and save the results in a separate file.
+
+    Pipelines that output a speaker-attributed transcription (a prediction with
+    a `word_level_transcription` attribute) additionally get their transcript
+    saved in STM format and evaluated with cpWER, tcpWER, tcorcWER and WER
+    against the protocol's "transcription" references (requires pyannistt).
     """
 
     assert nshard >= 1, f"nshard must be >= 1, got {nshard}"
@@ -826,7 +1004,9 @@ def benchmark(
     # --rank in [0, nshard), so just combine their outputs and compute
     # metrics over the full subset. no pipeline is loaded for this.
     if nshard > 1 and rank == -1:
-        _aggregate_shards(into, benchmark_name, nshard, files, per_file, optimize)
+        _aggregate_shards(
+            into, benchmark_name, nshard, files, per_file, optimize, normalizer
+        )
         raise typer.Exit()
 
     # load pretrained pipeline
@@ -853,6 +1033,7 @@ def benchmark(
         files = files[start:end]
         benchmark_name += f".{rank}of{nshard}"
         skip_metric = True
+        skip_wer = True
     else:
         # check that manual annotation is available for all files
         # (condition to actually run the benchmark)
@@ -862,6 +1043,15 @@ def benchmark(
                 f"Manual annotation is not available for files in {protocol} {subset.value} subset so skipping metric evaluation."
             )
             skip_metric = True
+
+        # same for manual transcription (condition to compute WER metrics,
+        # should the pipeline turn out to output transcriptions)
+        skip_wer = False
+        if any(file.get("transcription", None) is None for file in files):
+            print(
+                f"Manual transcription is not available for files in {protocol} {subset.value} subset so skipping WER evaluation."
+            )
+            skip_wer = True
 
     # used to store raw predictions in JSON format
     serialized_predictions: dict[str, dict] = dict()
@@ -883,11 +1073,22 @@ def benchmark(
         rttm_dir = benchmark_dir / "rttm"
         rttm_dir.mkdir(parents=True)
 
+        # created lazily, on the first transcription-capable prediction
+        stm_dir = benchmark_dir / "stm"
+
     else:
         rttm_file = into / f"{benchmark_name}.rttm"
         # make sure we don't overwrite previous results
         if rttm_file.exists():
             raise FileExistsError(f"{rttm_file} already exists.")
+
+        stm_file = into / f"{benchmark_name}.stm"
+        if stm_file.exists():
+            raise FileExistsError(f"{stm_file} already exists.")
+
+    # cpWER/tcpWER/tcorcWER/WER accumulator, instantiated on the first
+    # transcription-capable prediction (requires pyannistt)
+    wer_metrics: Optional[WERMetrics] = None
 
     if hasattr(pretrained_pipeline, "apply_batch"):
         iterator = pretrained_pipeline(files, progress=progress)
@@ -919,6 +1120,31 @@ def benchmark(
         with open(rttm_file, "w" if per_file else "a") as rttm:
             speaker_diarization.write_rttm(rttm)
 
+        # dump speaker-attributed transcription (if any) to STM file,
+        # and accumulate WER metrics when references are available
+        transcription = get_transcription(prediction)
+        if transcription is not None:
+            if per_file:
+                stm_dir.mkdir(exist_ok=True)
+                with open(stm_dir / f"{uri}.stm", "w") as stm:
+                    write_stm(stm, uri, transcription)
+            else:
+                with open(stm_file, "a") as stm:
+                    write_stm(stm, uri, transcription)
+
+            if not skip_wer and wer_metrics is None:
+                try:
+                    wer_metrics = WERMetrics(normalizer=normalizer)
+                except ImportError:
+                    print(
+                        "pyannistt is not available so skipping WER evaluation "
+                        "(pip install pyannistt to get cpWER/tcpWER/tcorcWER/WER)."
+                    )
+                    skip_wer = True
+
+            if not skip_wer:
+                wer_metrics(file, transcription)
+
         # compute metric when possible
         if not skip_metric:
             _ = metric(
@@ -928,12 +1154,13 @@ def benchmark(
             )
 
         # increment speaker count confusion matrix
-        pred_num_speakers: int = len(speaker_diarization.labels())
-        true_num_speakers: int = len(file["annotation"].labels())
-        speaker_count.setdefault(true_num_speakers, dict()).setdefault(
-            pred_num_speakers, 0
-        )
-        speaker_count[true_num_speakers][pred_num_speakers] += 1
+        if file.get("annotation", None) is not None:
+            pred_num_speakers: int = len(speaker_diarization.labels())
+            true_num_speakers: int = len(file["annotation"].labels())
+            speaker_count.setdefault(true_num_speakers, dict()).setdefault(
+                pred_num_speakers, 0
+            )
+            speaker_count[true_num_speakers][pred_num_speakers] += 1
 
         # keep track of prediction for later "min_duration_off" optimization
         if optimize:
@@ -976,6 +1203,11 @@ def benchmark(
 
     with open(speed_yml, "w") as yml:
         yaml.dump(processing, yml)
+
+    # save WER metric results (computed independently of the DER ones, so a
+    # transcription-only protocol still gets its WER report)
+    if wer_metrics is not None and not skip_wer:
+        wer_metrics.report(into, benchmark_name)
 
     # no need to go further than this point if evaluation is not possible
     if skip_metric:
