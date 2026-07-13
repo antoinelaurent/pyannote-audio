@@ -51,6 +51,8 @@ from scipy.optimize import minimize_scalar
 from typing_extensions import Annotated
 
 
+from pyannote.metrics.diarization import DiarizationErrorRate
+
 class Subset(str, Enum):
     train = "train"
     development = "development"
@@ -758,10 +760,10 @@ def _aggregate_shards(
             try:
                 wer_metrics = WERMetrics(normalizer=normalizer)
                 from pyannistt.benchmark.precomputed import Precomputed
-            except ImportError:
+            except ImportError as exc:
                 print(
-                    "pyannistt is not available so skipping WER evaluation "
-                    "(pip install pyannistt to get cpWER/tcpWER/tcorcWER/WER)."
+                    f"pyannistt (or one of its dependencies) is not available so "
+                    f"skipping WER evaluation: {exc}"
                 )
             else:
                 precomputed = Precomputed(combined_stm)
@@ -1135,10 +1137,10 @@ def benchmark(
             if not skip_wer and wer_metrics is None:
                 try:
                     wer_metrics = WERMetrics(normalizer=normalizer)
-                except ImportError:
+                except ImportError as exc:
                     print(
-                        "pyannistt is not available so skipping WER evaluation "
-                        "(pip install pyannistt to get cpWER/tcpWER/tcorcWER/WER)."
+                        f"pyannistt (or one of its dependencies) is not available "
+                        f"so skipping WER evaluation: {exc}"
                     )
                     skip_wer = True
 
