@@ -947,6 +947,15 @@ def benchmark(
             "pipeline outputs a speaker-attributed transcription."
         ),
     ] = "file",
+    use_oracle_diarization: Annotated[
+        bool,
+        typer.Option(
+            help="Gate the pipeline with the protocol's reference annotation "
+            "instead of its own diarization (requires a pipeline whose "
+            "apply_batch accepts precomputed_diarization). Isolates ASR "
+            "error from diarization error."
+        ),
+    ] = False,
     nshard: Annotated[
         int, typer.Option(help="Total number of shards.")
     ] = 1,
@@ -1001,6 +1010,8 @@ def benchmark(
     benchmark_name = f"{protocol}.{subset.value}"
     if num_speakers == NumSpeakers.ORACLE:
         benchmark_name += ".OracleNumSpeakers"
+    if use_oracle_diarization:
+        benchmark_name += ".OracleDiarization"
 
     # aggregation mode: every shard has already been run with its own
     # --rank in [0, nshard), so just combine their outputs and compute
@@ -1092,8 +1103,27 @@ def benchmark(
     # transcription-capable prediction (requires pyannistt)
     wer_metrics: Optional[WERMetrics] = None
 
+    batch_kwargs: dict = {}
+    if use_oracle_diarization:
+        missing = [file["uri"] for file in files if file.get("annotation") is None]
+        if missing:
+            print(
+                "--use-oracle-diarization requires a reference annotation for "
+                f"every file; missing for: {', '.join(missing[:5])}"
+            )
+            raise typer.Exit(code=1)
+        if not hasattr(pretrained_pipeline, "apply_batch"):
+            print(
+                "--use-oracle-diarization requires a pipeline whose apply_batch "
+                "accepts precomputed_diarization."
+            )
+            raise typer.Exit(code=1)
+        batch_kwargs["precomputed_diarization"] = {
+            file["uri"]: file["annotation"] for file in files
+        }
+
     if hasattr(pretrained_pipeline, "apply_batch"):
-        iterator = pretrained_pipeline(files, progress=progress)
+        iterator = pretrained_pipeline(files, progress=progress, **batch_kwargs)
     else:
         iterator = track(pretrained_pipeline(files), disable=not progress)
 
