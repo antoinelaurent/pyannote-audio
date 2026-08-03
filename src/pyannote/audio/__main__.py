@@ -857,6 +857,447 @@ def _aggregate_shards(
                 file["best_speaker_diarization"].write_rttm(rttm)
 
 
+@app.command("apply_multi")
+def apply_multi(
+pipeline: Annotated[
+        str,
+        typer.Argument(
+            help="Pretrained pipeline (e.g. pyannote/speaker-diarization-community-1)"
+        ),
+    ],
+    protocol: Annotated[
+        str,
+        typer.Argument(help="Benchmarked protocol"),
+    ],
+    into: Annotated[
+        Path,
+        typer.Argument(
+            help="Directory into which benchmark results are saved",
+            exists=True,
+            dir_okay=True,
+            file_okay=False,
+            writable=True,
+            resolve_path=True,
+        ),
+    ],
+    subset: Annotated[
+        Subset,
+        typer.Option(
+            help="Benchmarked subset",
+            case_sensitive=False,
+        ),
+    ] = Subset.test,
+    revision: Annotated[
+        Optional[str],
+        typer.Option(
+            help="Pretrained pipeline revision.",
+        ),
+    ] = None,
+    token: Annotated[
+        Optional[str],
+        typer.Argument(help="Huggingface token."),
+    ] = None,
+    cache: Annotated[
+        Optional[Path],
+        typer.Option(
+            help="Path to the folder where files downloaded from Huggingface are stored.",
+            exists=True,
+            dir_okay=True,
+            file_okay=False,
+            writable=True,
+            resolve_path=True,
+        ),
+    ] = None,
+    device: Annotated[
+        Device, typer.Option(help="Accelerator to use (CPU, CUDA, MPS)")
+    ] = Device.AUTO,
+    registry: Annotated[
+        Optional[Path],
+        typer.Option(
+            help="Loaded registry",
+            exists=True,
+            dir_okay=False,
+            file_okay=True,
+            readable=True,
+        ),
+    ] = None,
+    num_speakers: Annotated[
+        NumSpeakers, typer.Option(help="Number of speakers (oracle or auto)")
+    ] = NumSpeakers.AUTO,
+    optimize: Annotated[
+        bool,
+        typer.Option(
+            help="Evaluate both original and post-processed predictions.",
+        ),
+    ] = False,
+    progress: Annotated[
+        bool,
+        typer.Option(
+            help="Show progress",
+        ),
+    ] = False,
+    per_file: Annotated[
+        bool, typer.Option(help="Save one RTTM/JSON file per processed audio file.")
+    ] = False,
+    normalizer: Annotated[
+        str,
+        typer.Option(
+            help="Text normalization for WER metrics (none, file, english, chinese). "
+            "'file' uses each protocol file's 'language' key. Only used when the "
+            "pipeline outputs a speaker-attributed transcription."
+        ),
+    ] = "file",
+    use_oracle_diarization: Annotated[
+        bool,
+        typer.Option(
+            help="Gate the pipeline with the protocol's reference annotation "
+            "instead of its own diarization (requires a pipeline whose "
+            "apply_batch accepts precomputed_diarization). Isolates ASR "
+            "error from diarization error."
+        ),
+    ] = False,
+
+    return_variants : Annotated[
+         bool, typer.Option("return one output per distinct number of speakers encountered "
+                            "by SphereVBx, in reverse chronological order (final iteration first). "
+                            "When several iterations have the same number of speakers, only the "
+                            "iteration with the largest iteration number is returned.")
+    ] = True,
+):
+    if registry:
+        pyannote.database.registry.load_database(registry)
+
+    # make sure an "audio" key is available in protocol files
+    preprocessors = {"audio": pyannote.database.FileFinder()}
+
+    # pass number of speakers to pipeline if requested
+    if num_speakers == NumSpeakers.ORACLE:
+        preprocessors["pipeline_kwargs"] = lambda protocol_file: {
+            "num_speakers": len(protocol_file["annotation"].labels())
+        }
+
+    # load benchmark files
+    loaded_protocol = pyannote.database.registry.get_protocol(
+        protocol, preprocessors=preprocessors
+    )
+    files = list(getattr(loaded_protocol, subset.value)())
+
+    # `benchmark_name` is used as prefix to output files
+    benchmark_name = f"{protocol}.{subset.value}"
+    if num_speakers == NumSpeakers.ORACLE:
+        benchmark_name += ".OracleNumSpeakers"
+    if use_oracle_diarization:
+        benchmark_name += ".OracleDiarization"
+
+    # load pretrained pipeline
+    pretrained_pipeline = Pipeline.from_pretrained(
+        pipeline,
+        revision=revision,
+        token=token,
+        cache_dir=cache,
+    )
+    if pretrained_pipeline is None:
+        print(f"Could not load pretrained pipeline from {pipeline}.")
+        raise typer.Exit(code=1)
+
+    # send pipeline to device
+    torch_device = parse_device(device)
+    pretrained_pipeline.to(torch_device)
+
+    # restrict to this shard's slice of files, and disambiguate output
+    # filenames so shards run in parallel never clash with one another.
+    # metrics are only computed in aggregation mode (--rank -1), never
+    # during shard inference, since no single shard covers the full subset.
+    if nshard > 1:
+        start, end = get_shard_range(len(files), nshard, rank)
+        files = files[start:end]
+        benchmark_name += f".{rank}of{nshard}"
+        skip_metric = True
+        skip_wer = True
+    else:
+        # check that manual annotation is available for all files
+        # (condition to actually run the benchmark)
+        skip_metric = False
+        if any(file.get("annotation", None) is None for file in files):
+            print(
+                f"Manual annotation is not available for files in {protocol} {subset.value} subset so skipping metric evaluation."
+            )
+            skip_metric = True
+
+        # same for manual transcription (condition to compute WER metrics,
+        # should the pipeline turn out to output transcriptions)
+        skip_wer = False
+        if any(file.get("transcription", None) is None for file in files):
+            print(
+                f"Manual transcription is not available for files in {protocol} {subset.value} subset so skipping WER evaluation."
+            )
+            skip_wer = True
+
+    # used to store raw predictions in JSON format
+    serialized_predictions: dict[str, dict] = dict()
+
+    if not skip_metric:
+        # initialize diarization error rate metric
+        metric = DiarizationErrorRate()
+
+    # speaker count confusion matrix
+    # speaker_count[i][j] is the number of files with i speakers in the
+    # manual annotation and j speakers in the prediction
+    speaker_count: dict[int, dict[int, int]] = dict()
+
+    if per_file:
+        benchmark_dir = into / benchmark_name
+        if benchmark_dir.exists():
+            raise FileExistsError(f"{benchmark_dir} already exists.")
+
+        rttm_dir = benchmark_dir / "rttm"
+        rttm_dir.mkdir(parents=True)
+
+        # created lazily, on the first transcription-capable prediction
+        stm_dir = benchmark_dir / "stm"
+
+    else:
+        rttm_file = into / f"{benchmark_name}.rttm"
+        # make sure we don't overwrite previous results
+        if rttm_file.exists():
+            raise FileExistsError(f"{rttm_file} already exists.")
+
+        stm_file = into / f"{benchmark_name}.stm"
+        if stm_file.exists():
+            raise FileExistsError(f"{stm_file} already exists.")
+
+    # cpWER/tcpWER/tcorcWER/WER accumulator, instantiated on the first
+    # transcription-capable prediction (requires pyannistt)
+    wer_metrics: Optional[WERMetrics] = None
+
+    batch_kwargs: dict = {}
+    if use_oracle_diarization:
+        missing = [file["uri"] for file in files if file.get("annotation") is None]
+        if missing:
+            print(
+                "--use-oracle-diarization requires a reference annotation for "
+                f"every file; missing for: {', '.join(missing[:5])}"
+            )
+            raise typer.Exit(code=1)
+        if not hasattr(pretrained_pipeline, "apply_batch"):
+            print(
+                "--use-oracle-diarization requires a pipeline whose apply_batch "
+                "accepts precomputed_diarization."
+            )
+            raise typer.Exit(code=1)
+        batch_kwargs["precomputed_diarization"] = {
+            file["uri"]: file["annotation"] for file in files
+        }
+
+    if hasattr(pretrained_pipeline, "apply_batch"):
+        iterator = pretrained_pipeline(files, progress=progress, **batch_kwargs)
+    else:
+        iterator = track(pretrained_pipeline(files, return_variants=return_variants), disable=not progress)
+
+    tic: float = time.time()
+
+    for output in iterator:
+        import ipdb; ipdb.set_trace()
+
+    for file, prediction in iterator:
+        uri = file["uri"]
+
+        # if prediction has a built-in serialize method, save serialized version
+        if hasattr(prediction, "serialize"):
+            if per_file:
+                json_dir = benchmark_dir / "json"
+                json_dir.mkdir(exist_ok=True)
+
+                with open(json_dir / f"{uri}.json", "w") as f:
+                    json.dump(prediction.serialize(), f, indent=2)
+            else:
+                serialized_predictions[uri] = prediction.serialize()
+
+        # get speaker diarization from raw prediction
+        speaker_diarization = get_diarization(prediction)
+
+        # dump prediction to RTTM file
+        if per_file:
+            rttm_file = rttm_dir / f"{uri}.rttm"
+
+        with open(rttm_file, "w" if per_file else "a") as rttm:
+            speaker_diarization.write_rttm(rttm)
+
+        # dump speaker-attributed transcription (if any) to STM file,
+        # and accumulate WER metrics when references are available
+        transcription = get_transcription(prediction)
+        if transcription is not None:
+            if per_file:
+                stm_dir.mkdir(exist_ok=True)
+                with open(stm_dir / f"{uri}.stm", "w") as stm:
+                    write_stm(stm, uri, transcription)
+            else:
+                with open(stm_file, "a") as stm:
+                    write_stm(stm, uri, transcription)
+
+            if not skip_wer and wer_metrics is None:
+                try:
+                    wer_metrics = WERMetrics(normalizer=normalizer)
+                except ImportError as exc:
+                    print(
+                        f"pyannistt (or one of its dependencies) is not available "
+                        f"so skipping WER evaluation: {exc}"
+                    )
+                    skip_wer = True
+
+            if not skip_wer:
+                wer_metrics(file, transcription)
+
+        # compute metric when possible
+        if not skip_metric:
+            _ = metric(
+                file["annotation"],
+                speaker_diarization,
+                uem=file.get("annotated", None),
+            )
+
+        # increment speaker count confusion matrix
+        if file.get("annotation", None) is not None:
+            pred_num_speakers: int = len(speaker_diarization.labels())
+            true_num_speakers: int = len(file["annotation"].labels())
+            speaker_count.setdefault(true_num_speakers, dict()).setdefault(
+                pred_num_speakers, 0
+            )
+            speaker_count[true_num_speakers][pred_num_speakers] += 1
+
+        # keep track of prediction for later "min_duration_off" optimization
+        if optimize:
+            file["speaker_diarization"] = speaker_diarization
+
+    tac: float = time.time()
+
+    # save serialized predictions to disk (might contain more than just diarization results)
+    if serialized_predictions and not per_file:
+        with open(into / f"{benchmark_name}.json", "w") as f:
+            json.dump(serialized_predictions, f, indent=2)
+
+    # log processing time and capacity
+    processing = dict()
+    total_processing_time = tac - tic
+    total_playing_time = sum(Audio().get_duration(file) for file in files)
+    processing["seconds_per_hour"] = total_processing_time / (total_playing_time / 3600)
+    processing["times_faster_than_realtime"] = (
+            total_playing_time / total_processing_time
+    )
+    processing["total_processing_time"] = total_processing_time
+
+    # keep track of GPU device properties
+    if torch_device.type == "cuda":
+        props = torch.cuda.get_device_properties(torch_device)
+        props_dict = {}
+        for attr in dir(props):
+            if not attr.startswith("_"):
+                value = getattr(props, attr)
+                # Only include basic types (skip unpicklable like _CUuuid)
+                if isinstance(value, (int, float, str, bool, tuple, list)):
+                    props_dict[attr] = value
+
+        processing["device"] = props_dict
+        device_name = props_dict["name"].replace(" ", "-")
+        speed_yml = into / f"{benchmark_name}.{device_name}.yml"
+
+    else:
+        speed_yml = into / f"{benchmark_name}.yml"
+
+    with open(speed_yml, "w") as yml:
+        yaml.dump(processing, yml)
+
+    # save WER metric results (computed independently of the DER ones, so a
+    # transcription-only protocol still gets its WER report)
+    if wer_metrics is not None and not skip_wer:
+        wer_metrics.report(into, benchmark_name)
+
+    # no need to go further than this point if evaluation is not possible
+    if skip_metric:
+        raise typer.Exit()
+
+    # save metric results in both CSV and human-readable formats
+    with open(into / f"{benchmark_name}.csv", "w") as csv:
+        metric.report().to_csv(csv)
+
+    with open(into / f"{benchmark_name}.txt", "w") as txt:
+        txt.write(str(metric))
+
+    # turn speaker count confusion matrix into numpy array
+    # and save it to disk as a CSV file
+    max_true_speakers = max(speaker_count.keys())
+    max_pred_speakers = max(
+        max(speaker_count[true_speakers].keys())
+        for true_speakers in speaker_count.keys()
+    )
+    speaker_count_matrix = np.zeros(
+        (max_true_speakers + 1, max_pred_speakers + 1), dtype=int
+    )
+    for true_speakers, pred_counts in speaker_count.items():
+        for pred_speakers, count in pred_counts.items():
+            speaker_count_matrix[true_speakers, pred_speakers] = count
+
+    # compute the average error in the speaker count prediction
+    speaker_count_error: float = np.sum(
+        [
+            abs(true_speakers - pred_speakers) * count
+            for true_speakers, pred_counts in speaker_count.items()
+            for pred_speakers, count in pred_counts.items()
+        ]
+    ) / np.sum(speaker_count_matrix)
+
+    # compute the accuracy of the speaker count prediction
+    speaker_count_accuracy: float = np.sum(np.diag(speaker_count_matrix)) / np.sum(
+        speaker_count_matrix
+    )
+
+    np.savetxt(
+        into / f"{benchmark_name}.SpeakerCount.csv",
+        speaker_count_matrix,
+        delimiter=",",
+        fmt="%3d",
+        footer=f"Accuracy = {speaker_count_accuracy:.1%} / Average error = {speaker_count_error:.2f} speakers off",
+    )
+
+    # report metric results with an optimized min_duration_off
+    if optimize:
+        minDurationOffOptimizer = MinDurationOffOptimizer()
+        best_min_duration_off, best_report = minDurationOffOptimizer(files, metric)
+
+        with open(into / f"{benchmark_name}.OptimizedMinDurationOff.csv", "w") as csv:
+            best_report.to_csv(csv)
+
+        with open(into / f"{benchmark_name}.OptimizedMinDurationOff.txt", "w") as txt:
+            txt.write(
+                best_report.to_string(
+                    sparsify=False, float_format=lambda f: "{0:.2f}".format(f)
+                )
+            )
+
+        # keep track of the best `min_duration_off` value for later reference
+        with open(into / f"{benchmark_name}.OptimizedMinDurationOff.yml", "w") as yml:
+            yaml.dump({"min_duration_off": best_min_duration_off}, yml)
+
+        if not per_file:
+            optimized_rttm_file = (
+                    into / f"{benchmark_name}.OptimizedMinDurationOff.rttm"
+            )
+
+            # make sure we don't overwrite previous results
+            if optimized_rttm_file.exists():
+                raise FileExistsError(f"{optimized_rttm_file} already exists.")
+
+        for file in files:
+            if per_file:
+                optimized_rttm_file = (
+                        rttm_dir / f"{file['uri']}.OptimizedMinDurationOff.rttm"
+                )
+
+            with open(optimized_rttm_file, "w" if per_file else "a") as rttm:
+                file["best_speaker_diarization"].write_rttm(rttm)
+
+
+
 @app.command("benchmark")
 def benchmark(
     pipeline: Annotated[
