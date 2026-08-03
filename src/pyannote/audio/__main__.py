@@ -1128,6 +1128,8 @@ def apply_multi(
                 )
                 speaker_count[true_num_speakers][pred_num_speakers] += 1
 
+                print(f"uri:{uri} pred_num_speakers:{pred_num_speakers} true_num_speakers:{true_num_speakers}")
+
 
     # no need to go further than this point if evaluation is not possible
     if skip_metric:
