@@ -958,10 +958,11 @@ pipeline: Annotated[
     ] = False,
 
     return_variants : Annotated[
-         bool, typer.Option("return one output per distinct number of speakers encountered "
-                            "by SphereVBx, in reverse chronological order (final iteration first). "
-                            "When several iterations have the same number of speakers, only the "
-                            "iteration with the largest iteration number is returned.")
+         bool, typer.Option(
+             help="return one output per distinct number of speakers encountered "
+             "by SphereVBx, in reverse chronological order (final iteration first). "
+             "When several iterations have the same number of speakers, only the "
+             "iteration with the largest iteration number is returned.")
     ] = True,
 ):
     if registry:
@@ -1004,34 +1005,23 @@ pipeline: Annotated[
     torch_device = parse_device(device)
     pretrained_pipeline.to(torch_device)
 
-    # restrict to this shard's slice of files, and disambiguate output
-    # filenames so shards run in parallel never clash with one another.
-    # metrics are only computed in aggregation mode (--rank -1), never
-    # during shard inference, since no single shard covers the full subset.
-    if nshard > 1:
-        start, end = get_shard_range(len(files), nshard, rank)
-        files = files[start:end]
-        benchmark_name += f".{rank}of{nshard}"
+    # check that manual annotation is available for all files
+    # (condition to actually run the benchmark)
+    skip_metric = False
+    if any(file.get("annotation", None) is None for file in files):
+        print(
+            f"Manual annotation is not available for files in {protocol} {subset.value} subset so skipping metric evaluation."
+        )
         skip_metric = True
-        skip_wer = True
-    else:
-        # check that manual annotation is available for all files
-        # (condition to actually run the benchmark)
-        skip_metric = False
-        if any(file.get("annotation", None) is None for file in files):
-            print(
-                f"Manual annotation is not available for files in {protocol} {subset.value} subset so skipping metric evaluation."
-            )
-            skip_metric = True
 
-        # same for manual transcription (condition to compute WER metrics,
-        # should the pipeline turn out to output transcriptions)
-        skip_wer = False
-        if any(file.get("transcription", None) is None for file in files):
-            print(
-                f"Manual transcription is not available for files in {protocol} {subset.value} subset so skipping WER evaluation."
-            )
-            skip_wer = True
+    # same for manual transcription (condition to compute WER metrics,
+    # should the pipeline turn out to output transcriptions)
+    skip_wer = False
+    if any(file.get("transcription", None) is None for file in files):
+        print(
+            f"Manual transcription is not available for files in {protocol} {subset.value} subset so skipping WER evaluation."
+        )
+        skip_wer = True
 
     # used to store raw predictions in JSON format
     serialized_predictions: dict[str, dict] = dict()
